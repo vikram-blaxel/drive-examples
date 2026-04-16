@@ -1,4 +1,8 @@
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
 import asyncio
+import logging
 from google.adk.agents import LlmAgent, SequentialAgent
 from google.adk.apps import App
 from google.adk.runners import InMemoryRunner
@@ -7,59 +11,30 @@ from google.adk.tools.mcp_tool.mcp_session_manager import StreamableHTTPConnecti
 from google.genai import types
 from blaxel.core import DriveInstance, SandboxInstance, settings
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S")
+for _noisy in ("mcp", "google_genai", "LiteLLM", "litellm", "google.adk", "httpx", "httpcore"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+log = logging.getLogger(__name__)
+
 async def main():
 
-    drive = await DriveInstance.create_if_not_exists(
-        {
-            "name": "my-drive",
-            "region": "us-was-1",
-        }
-    )
-
-    setup_sandbox = await SandboxInstance.create_if_not_exists({
-      "name": "setup-sandbox",
-      "image": "blaxel/base-image:latest",
-      "memory": 4096,
-      "region": "us-was-1"
-    })
-
-
-    await setup_sandbox.drives.mount(
-        drive_name="my-drive",
-        mount_path="/data",
-    )
-
-    support_tickets = "\n".join([
-        "1. User cannot reset password, reset link expires immediately after clicking.",
-        "2. Multiple users report payment failures on credit cards, especially Visa.",
-        "3. App logs out users randomly after a few minutes of inactivity.",
-        "4. Feature request: ability to export reports to CSV format.",
-        "5. Mobile app crashes when uploading profile pictures.",
-        "6. Users are not receiving email notifications for important updates.",
-        "7. Dashboard takes too long to load, especially with large datasets.",
-        "8. Feature request: add dark mode for better night-time usability.",
-        "9. Some users are being charged twice for the same transaction.",
-        "10. Search functionality is returning irrelevant results for common queries.",
-        "11. Password reset emails are broken - the link in the email doesn't work.",
-        "12. Customer was billed twice for a single purchase.",
-    ])
-
-    await setup_sandbox.fs.write("/data/support_tickets.md", support_tickets)
-
-    await setup_sandbox.delete()
-
+    log.info("Support ticket triage pipeline")
+    log.info("Creating agent sandbox...")
     agent_sandbox = await SandboxInstance.create_if_not_exists({
       "name": "agent-sandbox",
       "image": "blaxel/base-image:latest",
       "memory": 4096,
       "region": "us-was-1"
     })
+    log.info("Agent sandbox ready: %s", agent_sandbox.metadata.name)
 
+    log.info("Mounting drive in agent sandbox at /data...")
     await agent_sandbox.drives.mount(
         drive_name="my-drive",
         mount_path="/data",
     )
 
+    log.info("Connecting to sandbox MCP toolset...")
     agent_sandbox_toolset = McpToolset(
         connection_params=StreamableHTTPConnectionParams(
             url=agent_sandbox.metadata.url + "/mcp",
@@ -67,9 +42,11 @@ async def main():
         )
     )
     tools = await agent_sandbox_toolset.get_tools()
+    log.info("MCP tools loaded: %d tool(s) available.", len(tools))
 
     model = "openai/gpt-4o"
 
+    log.info("Configuring agents (model: %s) for triage...", model)
     analyst_agent = LlmAgent(
         name="analyst",
         model=model,
@@ -77,6 +54,7 @@ async def main():
         tools=tools,
         output_key="analyst_report",
     )
+    log.info("  analyst  : /data/support_tickets.md → /data/analyst_report.md")
 
     manager_agent = LlmAgent(
         name="manager",
@@ -85,6 +63,7 @@ async def main():
         tools=tools,
         output_key="manager_report"
     )
+    log.info("  manager  : /data/analyst_report.md → /data/tasks.md")
 
     root_agent = SequentialAgent(
         name='ticket_triage_pipeline',
@@ -106,27 +85,39 @@ async def main():
         user_id=user_id
     )
 
-    print("Starting agent...")
+    log.info("Starting ticket triage pipeline...")
 
+    current_agent = None
     async for event in runner.run_async(
         user_id=user_id,
         session_id=session.id,
         new_message=types.Content(parts=[types.Part(text=task)])
     ):
-        if event.content and event.content.parts:
-            for part in event.content.parts:
-                if hasattr(part, 'text') and part.text:
-                    print(part.text, end="", flush=True)
-                    print()
+        if event.author != current_agent:
+            if event.author == "analyst":
+                log.info("[analyst] Reading /data/support_tickets.md from drive...")
+                log.info("[analyst] Analyzing and writing /data/analyst_report.md to drive...")
+            elif event.author == "manager":
+                log.info("[manager] Reading /data/analyst_report.md from drive...")
+                log.info("[manager] Analyzing and writing /data/tasks.md to drive...")
+            current_agent = event.author
+        # if event.content and event.content.parts:
+        #     for part in event.content.parts:
+        #         if hasattr(part, 'text') and part.text:
+        #             print(part.text, end="", flush=True)
+        #             print()
 
-    print("Agent finished!")
+    log.info("Pipeline finished.")
 
+    log.info("Reading /data/tasks.md from drive...")
     tasks = await agent_sandbox.fs.read("/data/tasks.md")
 
+    log.info("Deleting agent sandbox...")
     await agent_sandbox.delete()
+    log.info("Agent sandbox deleted.")
 
-    print("DEVELOPER TASK LIST")
-    print("-----------------")
-    print(tasks)
+    #print("\nDEVELOPER TASK LIST (from drive: /data/tasks.md)")
+    #print("-------------------------------------------------")
+    #print(tasks)
 
 asyncio.run(main())
